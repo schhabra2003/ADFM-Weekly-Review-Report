@@ -1,18 +1,13 @@
-# pages/18_Weekly_Risk_On_Off_Meter.py
-# ADFM - Weekly Risk On / Risk Off Meter
-# Built to sit on top of existing suite logic:
-# - Ratio charts for tape
-# - Stress composite as penalty
-# - Cross-asset confirmation
-# - Sector / factor participation
+import io
+from datetime import datetime, timedelta
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
 
 # ---------------- App config ----------------
 TITLE = "Weekly Risk On / Risk Off Meter"
@@ -24,6 +19,7 @@ st.caption("Weekly regime dashboard for positioning, gross, and hedge posture. D
 GRID = "#e8e8e8"
 TEXT = "#222222"
 
+
 def card_box(inner_html: str):
     st.markdown(
         f"""
@@ -33,6 +29,7 @@ def card_box(inner_html: str):
         """.strip(),
         unsafe_allow_html=True,
     )
+
 
 # ---------------- Sidebar ----------------
 with st.sidebar:
@@ -63,77 +60,110 @@ YF_TICKERS = [
 ] + SECTORS
 
 FRED_SERIES = {
-    "WALCL": "WALCL",           # Fed balance sheet
-    "RRP": "RRPONTSYD",         # Reverse repo
-    "TGA": "WTREGEN",           # Treasury General Account
-    "HY_OAS": "BAMLH0A0HYM2",   # HY OAS
-    "T10Y3M": "T10Y3M",         # 10Y minus 3M
-    "CP3M": "DCPF3M",           # 3M AA commercial paper
-    "TBILL3M": "DTB3",          # 3M T-bill
+    "WALCL": "WALCL",
+    "RRP": "RRPONTSYD",
+    "TGA": "WTREGEN",
+    "HY_OAS": "BAMLH0A0HYM2",
+    "T10Y3M": "T10Y3M",
+    "CP3M": "DCPF3M",
+    "TBILL3M": "DTB3",
 }
+
+FACTOR_TICKERS = ["MTUM", "QUAL", "VLUE", "USMV", "SIZE"]
+
 
 # ---------------- Data loaders ----------------
 @st.cache_data(show_spinner=False, ttl=3600)
 def load_yahoo(tickers, start):
-    raw = yf.download(
-        tickers,
-        start=start,
-        auto_adjust=True,
-        progress=False,
-        group_by="ticker",
-        threads=True,
-    )
+    try:
+        raw = yf.download(
+            tickers,
+            start=start,
+            auto_adjust=True,
+            progress=False,
+            group_by="ticker",
+            threads=True,
+        )
+    except Exception:
+        return pd.DataFrame()
 
     if raw is None or raw.empty:
         return pd.DataFrame()
 
     out = {}
+
     if isinstance(raw.columns, pd.MultiIndex):
         lvl0 = raw.columns.get_level_values(0)
         for t in tickers:
             if t in lvl0:
                 df_t = raw[t]
                 if "Close" in df_t.columns:
-                    s = df_t["Close"].dropna()
+                    s = pd.to_numeric(df_t["Close"], errors="coerce").dropna()
                     if not s.empty:
                         out[t] = s
     else:
         if "Close" in raw.columns and len(tickers) == 1:
-            out[tickers[0]] = raw["Close"].dropna()
+            out[tickers[0]] = pd.to_numeric(raw["Close"], errors="coerce").dropna()
 
     if not out:
         return pd.DataFrame()
 
     return pd.DataFrame(out).sort_index().dropna(how="all")
 
+
 @st.cache_data(show_spinner=False, ttl=3600)
-def load_fred(series_map):
-    out = {}
+def load_fred(series_map, start_date):
+    idx = pd.date_range(start=pd.to_datetime(start_date), end=pd.Timestamp.today(), freq="B")
+    out = pd.DataFrame(index=idx)
+
     for label, fred_id in series_map.items():
+        out[label] = np.nan
         url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={fred_id}"
-        df = pd.read_csv(url)
-        df.columns = ["Date", label]
-        df["Date"] = pd.to_datetime(df["Date"])
-        df[label] = pd.to_numeric(df[label], errors="coerce")
-        out[label] = df.set_index("Date")[label]
-    return pd.DataFrame(out).sort_index()
+
+        try:
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(req, timeout=20) as resp:
+                raw = resp.read()
+
+            df = pd.read_csv(io.BytesIO(raw))
+            df.columns = ["Date", label]
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+            df[label] = pd.to_numeric(df[label], errors="coerce")
+
+            s = df.set_index("Date")[label].sort_index()
+            out[label] = s.reindex(idx)
+
+        except (HTTPError, URLError, TimeoutError, ValueError):
+            pass
+
+    return out
+
 
 def weekly_last(df):
+    out = df.resample("W-FRI").last()
     if isinstance(df, pd.Series):
-        return df.resample("W-FRI").last().dropna()
-    return df.resample("W-FRI").last().dropna(how="all")
+        return out.dropna()
+    return out
 
-# ---------------- Signal helpers ----------------
+
+# ---------------- Helpers ----------------
+def get_series(df: pd.DataFrame, col: str, index: pd.Index) -> pd.Series:
+    if col in df.columns:
+        return pd.to_numeric(df[col], errors="coerce").reindex(index)
+    return pd.Series(np.nan, index=index, name=col)
+
+
 def safe_ratio(a: pd.Series, b: pd.Series) -> pd.Series:
-    a, b = a.align(b, join="inner")
+    a, b = a.align(b, join="outer")
     out = a / b.replace(0, np.nan)
-    return out.replace([np.inf, -np.inf], np.nan).dropna()
+    return out.replace([np.inf, -np.inf], np.nan)
+
 
 def zscore_last_window(s: pd.Series, window=52) -> pd.Series:
-    mu = s.rolling(window).mean()
-    sd = s.rolling(window).std(ddof=0)
-    z = (s - mu) / sd.replace(0, np.nan)
-    return z
+    mu = s.rolling(window, min_periods=max(8, window // 4)).mean()
+    sd = s.rolling(window, min_periods=max(8, window // 4)).std(ddof=0)
+    return (s - mu) / sd.replace(0, np.nan)
+
 
 def score_from_z(s: pd.Series, window=52, invert=False) -> pd.Series:
     z = zscore_last_window(s, window=window).clip(-2.5, 2.5)
@@ -141,6 +171,7 @@ def score_from_z(s: pd.Series, window=52, invert=False) -> pd.Series:
     if invert:
         score = 100 - score
     return score.clip(0, 100)
+
 
 def trend_score(s: pd.Series, fast=10, slow=40) -> pd.Series:
     fast_ma = s.rolling(fast, min_periods=1).mean()
@@ -151,9 +182,11 @@ def trend_score(s: pd.Series, fast=10, slow=40) -> pd.Series:
     score += np.where(fast_ma > slow_ma, 25, -25)
     return score.clip(0, 100)
 
+
 def roc_score(s: pd.Series, periods=4, window=52, invert=False) -> pd.Series:
     roc = s.pct_change(periods)
     return score_from_z(roc, window=window, invert=invert)
+
 
 def combo_score(s: pd.Series, invert=False) -> pd.Series:
     tr = trend_score(s)
@@ -163,13 +196,16 @@ def combo_score(s: pd.Series, invert=False) -> pd.Series:
         out = 100 - out
     return out.clip(0, 100)
 
+
 def realized_vol(px: pd.Series, window=21, ann=252) -> pd.Series:
     r = px.pct_change()
     return r.rolling(window).std() * np.sqrt(ann)
 
+
 def drawdown(px: pd.Series) -> pd.Series:
     peak = px.cummax()
     return (px / peak) - 1.0
+
 
 def label_regime(x: float) -> str:
     if x >= 70:
@@ -182,53 +218,75 @@ def label_regime(x: float) -> str:
         return "Mild Risk Off"
     return "Risk Off"
 
+
 # ---------------- Load data ----------------
 px_d = load_yahoo(YF_TICKERS, START)
-fred_d = load_fred(FRED_SERIES)
+fred_d = load_fred(FRED_SERIES, START)
 
 if px_d.empty:
     st.error("Failed to download Yahoo Finance data.")
     st.stop()
 
 px_w = weekly_last(px_d)
-fred_w = weekly_last(fred_d)
+master_index = px_w.index
 
-# Align everything to common start
-common_start = max(px_w.index.min(), fred_w.index.min())
-px_w = px_w.loc[common_start:].copy()
-fred_w = fred_w.loc[common_start:].copy()
+fred_w = weekly_last(fred_d).reindex(master_index).ffill()
 
-# Smooth selected inputs a bit for weekly reporting
 if smooth_weeks > 1:
     px_w = px_w.rolling(smooth_weeks, min_periods=1).mean()
     fred_w = fred_w.rolling(smooth_weeks, min_periods=1).mean()
 
+# ---------------- Series extraction ----------------
+spy = get_series(px_w, "SPY", master_index)
+rsp = get_series(px_w, "RSP", master_index)
+xly = get_series(px_w, "XLY", master_index)
+xlp = get_series(px_w, "XLP", master_index)
+iwm = get_series(px_w, "IWM", master_index)
+hyg = get_series(px_w, "HYG", master_index)
+lqd = get_series(px_w, "LQD", master_index)
+ief = get_series(px_w, "IEF", master_index)
+sphb = get_series(px_w, "SPHB", master_index)
+splv = get_series(px_w, "SPLV", master_index)
+smh = get_series(px_w, "SMH", master_index)
+fxy = get_series(px_w, "FXY", master_index)
+dbc = get_series(px_w, "DBC", master_index)
+gld = get_series(px_w, "GLD", master_index)
+vix = get_series(px_w, "^VIX", master_index).rename("VIX")
+vix3m = get_series(px_w, "^VIX3M", master_index)
+gspc = get_series(px_w, "^GSPC", master_index)
+hg = get_series(px_w, "HG=F", master_index)
+
 # ---------------- Derived series ----------------
-# Equity / ratio sleeve
-rsp_spy = safe_ratio(px_w["RSP"], px_w["SPY"]).rename("RSP/SPY")
-xly_xlp = safe_ratio(px_w["XLY"], px_w["XLP"]).rename("XLY/XLP")
-iwm_spy = safe_ratio(px_w["IWM"], px_w["SPY"]).rename("IWM/SPY")
-sphb_splv = safe_ratio(px_w["SPHB"], px_w["SPLV"]).rename("SPHB/SPLV")
+rsp_spy = safe_ratio(rsp, spy).rename("RSP/SPY")
+xly_xlp = safe_ratio(xly, xlp).rename("XLY/XLP")
+iwm_spy = safe_ratio(iwm, spy).rename("IWM/SPY")
+sphb_splv = safe_ratio(sphb, splv).rename("SPHB/SPLV")
 
-# Credit / vol sleeve
-hyg_lqd = safe_ratio(px_w["HYG"], px_w["LQD"]).rename("HYG/LQD")
-hyg_ief = safe_ratio(px_w["HYG"], px_w["IEF"]).rename("HYG/IEF")
-vix = px_w["^VIX"].dropna().rename("VIX")
-vix_vix3m = safe_ratio(px_w["^VIX"], px_w["^VIX3M"]).rename("VIX/VIX3M")
+hyg_lqd = safe_ratio(hyg, lqd).rename("HYG/LQD")
+hyg_ief = safe_ratio(hyg, ief).rename("HYG/IEF")
+vix_vix3m = safe_ratio(vix, vix3m).rename("VIX/VIX3M")
 
-# Cross-asset sleeve
-smh_fxy = safe_ratio(px_w["SMH"], px_w["FXY"]).rename("SMH/FXY")
-dbc_gld = safe_ratio(px_w["DBC"], px_w["GLD"]).rename("DBC/GLD")
-copper_gold = safe_ratio(px_w["HG=F"], px_w["GLD"]).rename("Copper/GoldProxy")
+smh_fxy = safe_ratio(smh, fxy).rename("SMH/FXY")
+dbc_gld = safe_ratio(dbc, gld).rename("DBC/GLD")
+copper_gold = safe_ratio(hg, gld).rename("Copper/GoldProxy")
 
-# Macro / liquidity sleeve
-fred_w["NET_LIQUIDITY"] = fred_w["WALCL"] - fred_w["RRP"] - fred_w["TGA"]
-netliq = fred_w["NET_LIQUIDITY"].rename("Net Liquidity")
-curve = fred_w["T10Y3M"].rename("10Y-3M")
-funding = (fred_w["CP3M"] - fred_w["TBILL3M"]).rename("CP-TBill")
+fred_w["NET_LIQUIDITY"] = (
+    get_series(fred_w, "WALCL", master_index)
+    - get_series(fred_w, "RRP", master_index)
+    - get_series(fred_w, "TGA", master_index)
+)
+netliq = get_series(fred_w, "NET_LIQUIDITY", master_index).rename("Net Liquidity")
+curve = get_series(fred_w, "T10Y3M", master_index).rename("10Y-3M")
+funding = (
+    get_series(fred_w, "CP3M", master_index)
+    - get_series(fred_w, "TBILL3M", master_index)
+).rename("CP-TBill")
 
 # Sector breadth
-sector_px = px_w[SECTORS].dropna(how="all")
+sector_px = pd.DataFrame(index=master_index)
+for s in SECTORS:
+    sector_px[s] = get_series(px_w, s, master_index)
+
 sector_fast = sector_px.rolling(10, min_periods=1).mean()
 sector_slow = sector_px.rolling(40, min_periods=1).mean()
 
@@ -236,78 +294,73 @@ pct_above_fast = ((sector_px > sector_fast).sum(axis=1) / len(SECTORS) * 100.0).
 pct_fast_above_slow = ((sector_fast > sector_slow).sum(axis=1) / len(SECTORS) * 100.0).rename("% 10W > 40W")
 sector_breadth = (0.5 * pct_above_fast + 0.5 * pct_fast_above_slow).rename("Sector Breadth")
 
-# Factor sleeve proxies
-# Keep simple and free-data friendly
-FACTOR_TICKERS = ["MTUM", "QUAL", "VLUE", "USMV", "SIZE"]
+# Factor sleeve
 factor_px_d = load_yahoo(FACTOR_TICKERS, START)
-factor_w = weekly_last(factor_px_d) if not factor_px_d.empty else pd.DataFrame()
+factor_regime = pd.Series(50.0, index=master_index, name="Factor Regime")
 
-factor_regime = pd.Series(index=px_w.index, dtype=float)
-if not factor_w.empty:
-    factor_w = factor_w.reindex(px_w.index).ffill()
+if not factor_px_d.empty:
+    factor_w = weekly_last(factor_px_d).reindex(master_index).ffill()
     mom_rows = []
+
     for f in factor_w.columns:
-        s = factor_w[f].dropna()
+        s = pd.to_numeric(factor_w[f], errors="coerce")
         short = s.pct_change(4)
-        long = s.pct_change(13)
-        trend = np.where(s > s.rolling(10, min_periods=1).mean(), 1, -1)
+        trend = pd.Series(np.where(s > s.rolling(10, min_periods=1).mean(), 1, -1), index=s.index)
         inflection = np.sign(short.diff())
+
         frame = pd.DataFrame(
             {
                 "Short": short,
-                "Long": long,
                 "Trend": trend,
                 "Inflection": inflection,
             }
         )
+
         score = (
             0.4 * frame["Short"].fillna(0)
             + 0.3 * frame["Inflection"].fillna(0)
             + 0.3 * frame["Trend"].fillna(0)
         )
         mom_rows.append(score.rename(f))
-    factor_scores = pd.concat(mom_rows, axis=1)
-    factor_raw = factor_scores.mean(axis=1)
-    factor_regime = (50 + 40 * zscore_last_window(factor_raw, window=52).clip(-1.25, 1.25)).clip(0, 100)
-    factor_regime = factor_regime.reindex(px_w.index).ffill()
-else:
-    factor_regime = pd.Series(50.0, index=px_w.index)
+
+    if mom_rows:
+        factor_scores = pd.concat(mom_rows, axis=1)
+        factor_raw = factor_scores.mean(axis=1)
+        factor_regime = (50 + 40 * zscore_last_window(factor_raw, window=52).clip(-1.25, 1.25)).clip(0, 100)
+        factor_regime = factor_regime.reindex(master_index).ffill().fillna(50)
 
 # ---------------- Bucket scores ----------------
-signals = {}
+signals = pd.DataFrame(index=master_index)
 
-signals["RSP/SPY"] = combo_score(rsp_spy)
-signals["XLY/XLP"] = combo_score(xly_xlp)
-signals["IWM/SPY"] = combo_score(iwm_spy)
-signals["SPHB/SPLV"] = combo_score(sphb_splv)
-signals["Sector Breadth"] = sector_breadth.clip(0, 100)
+signals["RSP/SPY"] = combo_score(rsp_spy).reindex(master_index).fillna(50)
+signals["XLY/XLP"] = combo_score(xly_xlp).reindex(master_index).fillna(50)
+signals["IWM/SPY"] = combo_score(iwm_spy).reindex(master_index).fillna(50)
+signals["SPHB/SPLV"] = combo_score(sphb_splv).reindex(master_index).fillna(50)
+signals["Sector Breadth"] = sector_breadth.reindex(master_index).fillna(50).clip(0, 100)
 
-signals["HYG/LQD"] = combo_score(hyg_lqd)
-signals["HYG/IEF"] = combo_score(hyg_ief)
-signals["VIX"] = score_from_z(vix, invert=True)
-signals["VIX/VIX3M"] = score_from_z(vix_vix3m, invert=True)
+signals["HYG/LQD"] = combo_score(hyg_lqd).reindex(master_index).fillna(50)
+signals["HYG/IEF"] = combo_score(hyg_ief).reindex(master_index).fillna(50)
+signals["VIX"] = score_from_z(vix, invert=True).reindex(master_index).fillna(50)
+signals["VIX/VIX3M"] = score_from_z(vix_vix3m, invert=True).reindex(master_index).fillna(50)
 
-signals["SMH/FXY"] = combo_score(smh_fxy)
-signals["DBC/GLD"] = combo_score(dbc_gld)
-signals["Copper/Gold"] = combo_score(copper_gold)
+signals["SMH/FXY"] = combo_score(smh_fxy).reindex(master_index).fillna(50)
+signals["DBC/GLD"] = combo_score(dbc_gld).reindex(master_index).fillna(50)
+signals["Copper/Gold"] = combo_score(copper_gold).reindex(master_index).fillna(50)
 
-signals["Net Liquidity"] = roc_score(netliq, periods=4, window=52)
-signals["10Y-3M"] = combo_score(curve)
-signals["Funding"] = score_from_z(funding, invert=True)
-signals["Factor Regime"] = factor_regime.clip(0, 100)
+signals["Net Liquidity"] = roc_score(netliq, periods=4, window=52).reindex(master_index).fillna(50)
+signals["10Y-3M"] = combo_score(curve).reindex(master_index).fillna(50)
+signals["Funding"] = score_from_z(funding, invert=True).reindex(master_index).fillna(50)
+signals["Factor Regime"] = factor_regime.reindex(master_index).fillna(50).clip(0, 100)
 
 eq_cols = ["RSP/SPY", "XLY/XLP", "IWM/SPY", "SPHB/SPLV", "Sector Breadth", "Factor Regime"]
 credit_cols = ["HYG/LQD", "HYG/IEF", "VIX", "VIX/VIX3M"]
 xasset_cols = ["SMH/FXY", "DBC/GLD", "Copper/Gold"]
 macro_cols = ["Net Liquidity", "10Y-3M", "Funding"]
 
-sig_df = pd.concat(signals, axis=1).dropna(how="all")
-sig_df = sig_df.reindex(px_w.index).ffill()
-
-equity_bucket = sig_df[eq_cols].mean(axis=1).rename("Equity Leadership")
-credit_bucket = sig_df[credit_cols].mean(axis=1).rename("Credit / Vol")
-xasset_bucket = sig_df[xasset_cols].mean(axis=1).rename("Cross Asset")
-macro_bucket = sig_df[macro_cols].mean(axis=1).rename("Liquidity / Macro")
+equity_bucket = signals[eq_cols].mean(axis=1).rename("Equity Leadership")
+credit_bucket = signals[credit_cols].mean(axis=1).rename("Credit / Vol")
+xasset_bucket = signals[xasset_cols].mean(axis=1).rename("Cross Asset")
+macro_bucket = signals[macro_cols].mean(axis=1).rename("Liquidity / Macro")
 
 base_score = (
     0.35 * equity_bucket
@@ -317,25 +370,23 @@ base_score = (
 ).rename("Base Score")
 
 # ---------------- Stress penalty sleeve ----------------
-# Mirrors your existing stress-composite logic family
-spx_w = px_w["^GSPC"].dropna()
-spy_rsp_stress = safe_ratio(px_w["SPY"], px_w["RSP"]).rename("SPY/RSP")
+spy_rsp_stress = safe_ratio(spy, rsp).rename("SPY/RSP")
 
-spx_daily = px_d["^GSPC"].dropna() if "^GSPC" in px_d.columns else pd.Series(dtype=float)
-rv21_daily = realized_vol(spx_daily, 21)
-rv21_w = weekly_last(rv21_daily).reindex(px_w.index).ffill()
+spx_daily = pd.to_numeric(px_d["^GSPC"], errors="coerce").dropna() if "^GSPC" in px_d.columns else pd.Series(dtype=float)
+rv21_daily = realized_vol(spx_daily, 21) if not spx_daily.empty else pd.Series(dtype=float)
+rv21_w = weekly_last(rv21_daily).reindex(master_index).ffill() if not rv21_daily.empty else pd.Series(np.nan, index=master_index)
 
-dd_w = (-drawdown(spx_w) * 100.0).rename("Drawdown")
+dd_w = (-drawdown(gspc) * 100.0).rename("Drawdown")
 
-stress_components = pd.DataFrame(index=px_w.index)
-stress_components["VIX"] = score_from_z(vix, invert=False)
-stress_components["HY_OAS"] = score_from_z(fred_w["HY_OAS"], invert=False)
-stress_components["HYG_LQD"] = score_from_z(hyg_lqd, invert=True)
-stress_components["Curve"] = score_from_z(curve, invert=True)
-stress_components["Funding"] = score_from_z(funding, invert=False)
-stress_components["Drawdown"] = score_from_z(dd_w, invert=False)
-stress_components["RV21"] = score_from_z(rv21_w, invert=False)
-stress_components["Breadth"] = score_from_z(spy_rsp_stress, invert=False)
+stress_components = pd.DataFrame(index=master_index)
+stress_components["VIX"] = score_from_z(vix, invert=False).reindex(master_index).fillna(50)
+stress_components["HY_OAS"] = score_from_z(get_series(fred_w, "HY_OAS", master_index), invert=False).reindex(master_index).fillna(50)
+stress_components["HYG_LQD"] = score_from_z(hyg_lqd, invert=True).reindex(master_index).fillna(50)
+stress_components["Curve"] = score_from_z(curve, invert=True).reindex(master_index).fillna(50)
+stress_components["Funding"] = score_from_z(funding, invert=False).reindex(master_index).fillna(50)
+stress_components["Drawdown"] = score_from_z(dd_w, invert=False).reindex(master_index).fillna(50)
+stress_components["RV21"] = score_from_z(rv21_w, invert=False).reindex(master_index).fillna(50)
+stress_components["Breadth"] = score_from_z(spy_rsp_stress, invert=False).reindex(master_index).fillna(50)
 
 stress_weights = {
     "VIX": 0.20,
@@ -350,19 +401,15 @@ stress_weights = {
 
 stress_score = sum(stress_weights[k] * stress_components[k] for k in stress_weights).rename("Stress Score")
 stress_penalty = ((stress_score - 50).clip(lower=0) * 0.45).rename("Stress Penalty")
-
 risk_score = (base_score - stress_penalty).clip(0, 100).rename("Risk Score")
 
 # ---------------- Diagnostics ----------------
-bucket_df = pd.concat([equity_bucket, credit_bucket, xasset_bucket, macro_bucket, stress_score], axis=1)
-bucket_now = bucket_df.iloc[-1].copy()
+signal_now = signals.iloc[-1].sort_values(ascending=False).to_frame("Score")
+signal_now["1W Δ"] = signals.diff(1).iloc[-1].reindex(signal_now.index)
+signal_now["4W Δ"] = signals.diff(4).iloc[-1].reindex(signal_now.index)
 
-signal_now = sig_df.iloc[-1].sort_values(ascending=False).to_frame("Score")
-signal_now["1W Δ"] = sig_df.diff(1).iloc[-1].reindex(signal_now.index)
-signal_now["4W Δ"] = sig_df.diff(4).iloc[-1].reindex(signal_now.index)
-
-breadth = ((sig_df > 50).sum(axis=1) / sig_df.shape[1] * 100.0).rename("Signal Breadth")
-confidence = (100.0 - sig_df.std(axis=1).clip(0, 50) * 2.0).clip(0, 100).rename("Confidence")
+breadth = ((signals > 50).sum(axis=1) / signals.shape[1] * 100.0).rename("Signal Breadth")
+confidence = (100.0 - signals.std(axis=1).clip(0, 50) * 2.0).clip(0, 100).rename("Confidence")
 
 curr = float(risk_score.iloc[-1])
 prev_1w = float(risk_score.iloc[-2]) if len(risk_score) > 1 else curr
@@ -435,6 +482,7 @@ with top_right:
                 showlegend=False,
             )
         )
+
     fig_bars.update_layout(
         height=320,
         margin=dict(l=10, r=20, t=10, b=10),
